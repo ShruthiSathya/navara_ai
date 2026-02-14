@@ -19,7 +19,7 @@ function App() {
     setStreamingStatus('Starting analysis...');
 
     try {
-      const response = await fetch('http://localhost:8000/api/repurpose/stream', {
+      const response = await fetch('http://localhost:8000/analyze', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
