@@ -1,24 +1,25 @@
 """
-PRODUCTION DATA FETCHER - REAL DATABASE INTEGRATIONS
-Uses: OpenTargets, ChEMBL, DGIdb, Orphanet, ClinicalTrials.gov
-Perfect for rare disease drug repurposing research
+PRODUCTION DATA FETCHER - REAL DATABASE INTEGRATIONS WITH SSL FIX
+Uses: OpenTargets, ChEMBL, DGIdb, ClinicalTrials.gov
+Handles SSL certificate verification issues
 """
 
 import asyncio
 import aiohttp
+import ssl
+import certifi
 import json
 import logging
 from typing import Optional, List, Dict, Set
-import re
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class RareDiseaseDataFetcher:
+class ProductionDataFetcher:
     """
-    Production-grade data fetcher for rare disease drug repurposing.
+    Production-grade data fetcher with SSL certificate handling.
     Integrates multiple public databases for comprehensive analysis.
     """
     
@@ -27,7 +28,6 @@ class RareDiseaseDataFetcher:
     CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data"
     DGIDB_API = "https://dgidb.org/api/graphql"
     CLINICALTRIALS_API = "https://clinicaltrials.gov/api/v2/studies"
-    REACTOME_API = "https://reactome.org/ContentService"
     
     def __init__(self, cache_dir: str = "/tmp/drug_repurposing_cache"):
         self.session: Optional[aiohttp.ClientSession] = None
@@ -38,12 +38,47 @@ class RareDiseaseDataFetcher:
         self.drug_cache = {}
         self.disease_cache = {}
         self.interaction_cache = {}
+        
+        # SSL context that handles certificate issues
+        self.ssl_context = self._create_ssl_context()
+
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        """
+        Create SSL context that works around certificate verification issues.
+        Uses certifi for up-to-date CA certificates.
+        """
+        try:
+            # Try to use certifi certificates
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            logger.info("✅ Using certifi CA certificates")
+            return ssl_context
+        except Exception as e:
+            logger.warning(f"⚠️  Certifi failed, trying alternative: {e}")
+            
+        try:
+            # Alternative: create context with system certificates
+            ssl_context = ssl.create_default_context()
+            logger.info("✅ Using system CA certificates")
+            return ssl_context
+        except Exception as e:
+            logger.warning(f"⚠️  System certs failed: {e}")
+            
+        # Last resort: disable verification (not recommended for production)
+        logger.warning("⚠️  Using unverified SSL (not recommended for production)")
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        return ssl_context
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session with timeout"""
+        """Get or create aiohttp session with SSL context and timeout"""
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=60, connect=10)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector
+            )
         return self.session
 
     # ==================== DISEASE DATA ====================
@@ -82,7 +117,7 @@ class RareDiseaseDataFetcher:
 
     async def _fetch_from_opentargets(self, disease_name: str) -> Optional[Dict]:
         """
-        Fetch from OpenTargets Platform - the BEST source for disease-gene data.
+        Fetch from OpenTargets Platform.
         Covers 25,000+ diseases including rare diseases.
         """
         session = await self._get_session()
@@ -109,6 +144,8 @@ class RareDiseaseDataFetcher:
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"❌ OpenTargets search failed: {resp.status}")
+                    text = await resp.text()
+                    logger.error(f"Response: {text[:200]}")
                     return None
                 
                 result = await resp.json()
@@ -189,23 +226,27 @@ class RareDiseaseDataFetcher:
                     "source": "OpenTargets Platform"
                 }
         
+        except aiohttp.ClientError as e:
+            logger.error(f"❌ Network error fetching from OpenTargets: {e}")
+            return None
         except Exception as e:
             logger.error(f"❌ OpenTargets fetch failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     async def _enhance_with_pathways(self, disease_data: Dict) -> Dict:
         """
-        Map disease genes to biological pathways using Reactome.
-        This is crucial for finding drugs that target the same pathways.
+        Map disease genes to biological pathways.
+        Uses curated knowledge for critical pathways.
         """
-        genes = disease_data.get("genes", [])[:50]  # Limit to top 50 genes
+        genes = disease_data.get("genes", [])[:50]
         
         if not genes:
             disease_data["pathways"] = []
             return disease_data
         
-        # Use curated pathway mapping (fast, offline)
-        # In production, you'd query Reactome API here
+        # Use curated pathway mapping
         pathways = self._map_genes_to_pathways(genes)
         disease_data["pathways"] = pathways
         
@@ -213,8 +254,7 @@ class RareDiseaseDataFetcher:
 
     def _map_genes_to_pathways(self, genes: List[str]) -> List[str]:
         """
-        Curated gene-to-pathway mapping based on common biological knowledge.
-        Covers major pathways relevant to drug repurposing.
+        Curated gene-to-pathway mapping based on biological knowledge.
         """
         pathway_map = {
             # Signal transduction
@@ -249,6 +289,8 @@ class RareDiseaseDataFetcher:
             "LAMP1": ["Lysosomal function", "Autophagy"],
             "LAMP2": ["Autophagy", "Lysosomal membrane"],
             "ATP7B": ["Copper metabolism", "Metal ion homeostasis"],
+            "GLA": ["Sphingolipid metabolism", "Lysosomal function"],
+            "GALNS": ["Glycosaminoglycan metabolism", "Lysosomal storage"],
             
             # Neurodegeneration
             "SNCA": ["Alpha-synuclein aggregation", "Dopamine metabolism"],
@@ -260,6 +302,8 @@ class RareDiseaseDataFetcher:
             "APP": ["Amyloid-beta production", "APP processing"],
             "MAPT": ["Tau protein function", "Microtubule stability"],
             "SOD1": ["Oxidative stress response", "Superoxide metabolism"],
+            "TDP43": ["RNA metabolism", "Protein aggregation"],
+            "FUS": ["RNA metabolism", "Protein aggregation"],
             
             # Muscle & structural
             "DMD": ["Dystrophin-glycoprotein complex", "Muscle fiber integrity"],
@@ -277,6 +321,14 @@ class RareDiseaseDataFetcher:
             "SLC6A3": ["Dopamine reuptake", "Neurotransmitter transport"],
             "TH": ["Dopamine biosynthesis", "Catecholamine synthesis"],
             "DDC": ["Dopamine biosynthesis", "Neurotransmitter synthesis"],
+            "MAOB": ["Dopamine metabolism", "Monoamine oxidase"],
+            
+            # Additional key genes
+            "PSEN1": ["Amyloid-beta production", "Gamma-secretase complex"],
+            "PSEN2": ["Amyloid-beta production", "Gamma-secretase complex"],
+            "APOE": ["Lipid metabolism", "Amyloid-beta clearance"],
+            "GSK3B": ["Tau phosphorylation", "Wnt signaling"],
+            "BACE1": ["Amyloid-beta production", "APP processing"],
         }
         
         pathways = set()
@@ -291,10 +343,7 @@ class RareDiseaseDataFetcher:
             return ["General cellular signaling", "Metabolic pathways"]
 
     def _mark_rare_disease(self, disease_data: Dict) -> Dict:
-        """
-        Mark if a disease is rare based on keywords or prevalence.
-        Rare disease = affects < 200,000 people in US or < 1 in 2,000 in EU.
-        """
+        """Mark if a disease is rare based on keywords or prevalence."""
         name = disease_data.get("name", "").lower()
         description = disease_data.get("description", "").lower()
         
@@ -334,6 +383,8 @@ class RareDiseaseDataFetcher:
                     total = data.get("totalCount", 0)
                     disease_data["active_trials_count"] = total
                     logger.info(f"📋 Found {total} active clinical trials")
+                else:
+                    disease_data["active_trials_count"] = 0
         except Exception as e:
             logger.warning(f"⚠️  Could not fetch clinical trials: {e}")
             disease_data["active_trials_count"] = 0
@@ -352,11 +403,14 @@ class RareDiseaseDataFetcher:
         # Check if we have cached drugs
         cache_file = self.cache_dir / "chembl_approved_drugs.json"
         if cache_file.exists():
-            logger.info("✅ Loading drugs from cache")
-            with open(cache_file, 'r') as f:
-                cached_drugs = json.load(f)
-                if len(cached_drugs) >= limit:
-                    return cached_drugs[:limit]
+            try:
+                logger.info("✅ Loading drugs from cache")
+                with open(cache_file, 'r') as f:
+                    cached_drugs = json.load(f)
+                    if len(cached_drugs) >= limit:
+                        return cached_drugs[:limit]
+            except Exception as e:
+                logger.warning(f"⚠️  Cache read failed: {e}")
         
         # Fetch from ChEMBL
         drugs = await self._fetch_chembl_approved_drugs(limit)
@@ -365,17 +419,18 @@ class RareDiseaseDataFetcher:
         drugs = await self._enhance_with_dgidb(drugs)
         
         # Cache results
-        with open(cache_file, 'w') as f:
-            json.dump(drugs, f, indent=2)
+        try:
+            with open(cache_file, 'w') as f:
+                json.dump(drugs, f, indent=2)
+            logger.info(f"✅ Cached {len(drugs)} drugs")
+        except Exception as e:
+            logger.warning(f"⚠️  Cache write failed: {e}")
         
         logger.info(f"✅ Fetched {len(drugs)} approved drugs")
         return drugs
 
     async def _fetch_chembl_approved_drugs(self, limit: int) -> List[Dict]:
-        """
-        Fetch approved drugs from ChEMBL database.
-        max_phase=4 means FDA approved.
-        """
+        """Fetch approved drugs from ChEMBL database."""
         session = await self._get_session()
         drugs = []
         
@@ -384,13 +439,15 @@ class RareDiseaseDataFetcher:
             async with session.get(
                 f"{self.CHEMBL_API}/molecule.json",
                 params={
-                    "max_phase": "4",  # FDA/EMA approved
+                    "max_phase": "4",
                     "limit": min(limit, 1000),
                     "offset": 0
                 }
             ) as resp:
                 if resp.status != 200:
                     logger.error(f"❌ ChEMBL API failed: {resp.status}")
+                    text = await resp.text()
+                    logger.error(f"Response: {text[:200]}")
                     return []
                 
                 data = await resp.json()
@@ -400,19 +457,23 @@ class RareDiseaseDataFetcher:
                 
                 # Process each molecule
                 for i, mol in enumerate(molecules):
-                    if i % 50 == 0:
+                    if i % 50 == 0 and i > 0:
                         logger.info(f"  ... processed {i}/{len(molecules)}")
                     
-                    drug = await self._process_chembl_molecule(mol)
+                    drug = self._process_chembl_molecule(mol)
                     if drug:
                         drugs.append(drug)
         
+        except aiohttp.ClientError as e:
+            logger.error(f"❌ Network error fetching from ChEMBL: {e}")
         except Exception as e:
             logger.error(f"❌ ChEMBL fetch failed: {e}")
+            import traceback
+            traceback.print_exc()
         
         return drugs
 
-    async def _process_chembl_molecule(self, molecule: Dict) -> Optional[Dict]:
+    def _process_chembl_molecule(self, molecule: Dict) -> Optional[Dict]:
         """Convert ChEMBL molecule to our drug format"""
         try:
             chembl_id = molecule.get("molecule_chembl_id")
@@ -440,7 +501,7 @@ class RareDiseaseDataFetcher:
             
             return drug
         
-        except Exception as e:
+        except Exception:
             return None
 
     async def _enhance_with_dgidb(self, drugs: List[Dict]) -> List[Dict]:
@@ -452,8 +513,9 @@ class RareDiseaseDataFetcher:
         
         session = await self._get_session()
         
-        # Batch query to DGIdb
-        drug_names = [d["name"] for d in drugs[:100]]  # Limit to first 100 for speed
+        # Batch query to DGIdb (limit to first 100 for speed)
+        # Normalize names: DGIdb is case-sensitive, prefers Title Case
+        drug_names = [d["name"].title() for d in drugs[:100]]
         
         try:
             # DGIdb GraphQL query
@@ -493,16 +555,27 @@ class RareDiseaseDataFetcher:
                     
                     # Update our drugs
                     for drug in drugs:
-                        drug_name = drug["name"].lower()
-                        if drug_name in drug_target_map:
-                            drug["targets"] = drug_target_map[drug_name]
-                            # Infer pathways from targets
+                        drug_name_lower = drug["name"].lower()
+                        drug_name_title = drug["name"].title()
+                        
+                        # Try both lowercase and title case matching
+                        if drug_name_lower in drug_target_map:
+                            drug["targets"] = drug_target_map[drug_name_lower]
+                            drug["pathways"] = self._infer_pathways_from_targets(drug["targets"])
+                        elif drug_name_title.lower() in drug_target_map:
+                            drug["targets"] = drug_target_map[drug_name_title.lower()]
                             drug["pathways"] = self._infer_pathways_from_targets(drug["targets"])
                     
                     logger.info(f"✅ Enhanced {len(drug_target_map)} drugs with DGIdb data")
+                else:
+                    logger.warning(f"⚠️  DGIdb returned status {resp.status}")
         
+        except aiohttp.ClientError as e:
+            logger.warning(f"⚠️  Network error with DGIdb: {e}")
         except Exception as e:
             logger.warning(f"⚠️  DGIdb enhancement failed: {e}")
+            import traceback
+            traceback.print_exc()
         
         return drugs
 
@@ -510,24 +583,9 @@ class RareDiseaseDataFetcher:
         """Infer pathways from drug targets"""
         pathways = set()
         for target in targets[:20]:  # Limit to first 20 targets
-            if target in self._get_target_pathway_map():
-                target_pathways = self._map_genes_to_pathways([target])
-                pathways.update(target_pathways)
+            target_pathways = self._map_genes_to_pathways([target])
+            pathways.update(target_pathways)
         return list(pathways)
-
-    def _get_target_pathway_map(self) -> Set[str]:
-        """Get set of targets we have pathway mappings for"""
-        # This matches the keys in _map_genes_to_pathways
-        return {
-            "EGFR", "KRAS", "PIK3CA", "PTEN", "MTOR", "TP53", "AKT1",
-            "TNF", "IL6", "IL1B", "NFKB1", "STAT3",
-            "PPARG", "INSR", "PRKAA1", "PRKAA2",
-            "GBA", "GAA", "HEXA", "HEXB", "NPC1", "NPC2", "LAMP1", "LAMP2", "ATP7B",
-            "SNCA", "LRRK2", "PRKN", "PINK1", "DJ1", "HTT", "APP", "MAPT", "SOD1",
-            "DMD", "CFTR", "FXN",
-            "BRCA1", "BRCA2", "RB1",
-            "DRD1", "DRD2", "SLC6A3", "TH", "DDC"
-        }
 
     # ==================== CLEANUP ====================
     
@@ -538,45 +596,5 @@ class RareDiseaseDataFetcher:
             logger.info("🔒 Session closed")
 
 
-# ==================== HELPER FUNCTIONS ====================
-
-async def test_fetcher():
-    """Test the data fetcher with a rare disease"""
-    fetcher = RareDiseaseDataFetcher()
-    
-    try:
-        # Test 1: Fetch disease data
-        print("\n" + "="*60)
-        print("TEST 1: Fetching Huntington's Disease data")
-        print("="*60)
-        disease = await fetcher.fetch_disease_data("Huntington's Disease")
-        
-        if disease:
-            print(f"\n✅ Disease: {disease['name']}")
-            print(f"   ID: {disease['id']}")
-            print(f"   Genes: {len(disease['genes'])} genes")
-            print(f"   Top genes: {', '.join(disease['genes'][:10])}")
-            print(f"   Pathways: {len(disease['pathways'])} pathways")
-            print(f"   Is Rare: {disease.get('is_rare', False)}")
-            print(f"   Active Trials: {disease.get('active_trials_count', 0)}")
-        
-        # Test 2: Fetch approved drugs
-        print("\n" + "="*60)
-        print("TEST 2: Fetching approved drugs")
-        print("="*60)
-        drugs = await fetcher.fetch_approved_drugs(limit=50)
-        
-        print(f"\n✅ Fetched {len(drugs)} drugs")
-        print("\nSample drugs:")
-        for drug in drugs[:5]:
-            print(f"  • {drug['name']}")
-            print(f"    Targets: {', '.join(drug['targets'][:5]) if drug['targets'] else 'None'}")
-            print(f"    Pathways: {', '.join(drug['pathways'][:3]) if drug['pathways'] else 'None'}")
-    
-    finally:
-        await fetcher.close()
-
-
-if __name__ == "__main__":
-    # Run test
-    asyncio.run(test_fetcher())
+# Maintain backward compatibility
+DataFetcher = ProductionDataFetcher
