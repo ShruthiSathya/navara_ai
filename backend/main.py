@@ -38,7 +38,7 @@ async def startup_event():
     logger.info("📊 Databases: OpenTargets, ChEMBL, DGIdb, ClinicalTrials.gov")
     try:
         pipeline = ProductionPipeline()
-        await pipeline.initialize()
+        # ProductionPipeline initializes itself in __init__, no separate initialize() needed
         logger.info("✅ API ready!")
     except Exception as e:
         logger.error(f"❌ Failed to initialize pipeline: {e}")
@@ -48,8 +48,7 @@ async def startup_event():
 async def shutdown_event():
     """Clean up on shutdown."""
     global pipeline
-    if pipeline:
-        await pipeline.close()
+    # ProductionPipeline doesn't have a close() method
     logger.info("👋 API shutdown complete")
 
 @app.get("/", tags=["Health"])
@@ -87,7 +86,7 @@ async def analyze_disease(request: dict):
         
         logger.info(f"Analysis request: {disease_name}")
         
-        # Run gene-based analysis (FIXED METHOD NAME)
+        # Run gene-based analysis
         result = await pipeline.analyze_disease(
             disease_name=disease_name,
             min_score=min_score,
@@ -97,37 +96,59 @@ async def analyze_disease(request: dict):
         if not result['success']:
             return result
         
+        # ⭐ FIX: Ensure candidates have the required fields for filtering
+        candidates = result.get('candidates', [])
+        for candidate in candidates:
+            # Ensure 'indication' field exists (drug_filter expects 'indication')
+            if 'indication' not in candidate and 'original_indication' in candidate:
+                candidate['indication'] = candidate['original_indication']
+            elif 'indication' not in candidate:
+                candidate['indication'] = ''
+            
+            # Ensure 'mechanism' field exists
+            if 'mechanism' not in candidate:
+                candidate['mechanism'] = ''
+        
         # ⭐ NEW: Apply safety filter
         safety_filter = DrugSafetyFilter()
         
-        original_count = len(result.get('candidates', []))
+        original_count = len(candidates)
         
-        safe_candidates, filtered_out = safety_filter.filter_candidates(
-            candidates=result.get('candidates', []),
-            disease_name=disease_name,
-            remove_absolute=True,   # Remove absolutely contraindicated
-            remove_relative=False   # Keep relatively contraindicated (with warning)
-        )
-        
-        # Limit to requested max_results after filtering
-        safe_candidates = safe_candidates[:max_results]
-        
-        logger.info(
-            f"Safety filter: {original_count} → {len(safe_candidates)} candidates "
-            f"({len(filtered_out)} filtered out)"
-        )
-        
-        # Update result with filtered candidates
-        result['candidates'] = safe_candidates
-        result['filtered_count'] = len(filtered_out)
-        result['filtered_drugs'] = [
-            {
-                'drug_name': c['drug_name'],
-                'reason': c.get('contraindication', {}).get('reason', 'Unknown'),
-                'severity': c.get('contraindication', {}).get('severity', 'unknown')
-            }
-            for c in filtered_out
-        ]
+        try:
+            safe_candidates, filtered_out = safety_filter.filter_candidates(
+                candidates=candidates,
+                disease_name=disease_name,
+                remove_absolute=True,   # Remove absolutely contraindicated
+                remove_relative=False   # Keep relatively contraindicated (with warning)
+            )
+            
+            # Limit to requested max_results after filtering
+            safe_candidates = safe_candidates[:max_results]
+            
+            logger.info(
+                f"Safety filter: {original_count} → {len(safe_candidates)} candidates "
+                f"({len(filtered_out)} filtered out)"
+            )
+            
+            # Update result with filtered candidates
+            result['candidates'] = safe_candidates
+            result['filtered_count'] = len(filtered_out)
+            result['filtered_drugs'] = [
+                {
+                    'drug_name': c['drug_name'],
+                    'reason': c.get('contraindication', {}).get('reason', 'Unknown'),
+                    'severity': c.get('contraindication', {}).get('severity', 'unknown')
+                }
+                for c in filtered_out
+            ]
+            
+        except Exception as filter_error:
+            logger.error(f"Safety filter error: {filter_error}")
+            # If filtering fails, return unfiltered results with warning
+            result['candidates'] = candidates[:max_results]
+            result['filtered_count'] = 0
+            result['filtered_drugs'] = []
+            result['filter_warning'] = f"Safety filter error: {str(filter_error)}"
         
         return result
     
