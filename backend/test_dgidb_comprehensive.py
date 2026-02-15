@@ -1,119 +1,79 @@
-import asyncio
-import aiohttp
-import ssl
-import certifi
-import json
+"""
+Run this directly: python3 debug_dgidb_now.py
+It introspects DrugConnection then tries every access pattern.
+"""
+import asyncio, ssl, certifi
+
+try:
+    import aiohttp
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "certifi", "-q"])
+    import aiohttp
 
 
-async def test_correct_format():
-    print("\n" + "="*80)
-    print("🎯 TESTING CORRECT DGIDB FORMAT (Connection/Edges Pattern)")
-    print("="*80)
-    
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
+async def main():
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    conn = aiohttp.TCPConnector(ssl=ssl_ctx)
     timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(ssl=ssl_context)
-    
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        
-        # The CORRECT format using edges/node pattern
-        query = """
-        query GetDrugs($names: [String!]!) {
-          drugs(names: $names, first: 10) {
-            edges {
-              node {
-                name
-                conceptId
-                approved
-                interactions {
-                  edges {
-                    node {
-                      gene {
-                        name
-                      }
-                      interactionTypes {
-                        type
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        """
-        
-        test_drugs = ["NILOTINIB", "IMATINIB", "ASPIRIN", "METFORMIN"]
-        
-        print(f"\n📋 Testing with drugs: {test_drugs}")
-        print("-" * 80)
-        
-        try:
+
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+
+        async def gql(q, v=None):
+            body = {"query": q}
+            if v:
+                body["variables"] = v
             async with session.post(
                 "https://dgidb.org/api/graphql",
-                json={
-                    "query": query,
-                    "variables": {"names": test_drugs}
-                },
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                print(f"Status: {resp.status}")
-                
-                if resp.status != 200:
-                    text = await resp.text()
-                    print(f"❌ Error: {text[:500]}")
-                    return
-                
-                data = await resp.json()
-                
-                if 'errors' in data:
-                    print(f"❌ GraphQL Errors:")
-                    for error in data['errors']:
-                        print(f"   - {error.get('message')}")
-                    return
-                
-                if 'data' not in data or 'drugs' not in data['data']:
-                    print(f"❌ Unexpected response structure")
-                    print(f"Response: {json.dumps(data, indent=2)[:500]}")
-                    return
-                
-                edges = data['data']['drugs'].get('edges', [])
-                
-                print(f"\n✅ SUCCESS! Found {len(edges)} drugs")
-                print("=" * 80)
-                
-                for edge in edges:
-                    node = edge.get('node', {})
-                    drug_name = node.get('name', 'Unknown')
-                    concept_id = node.get('conceptId', 'N/A')
-                    approved = node.get('approved', False)
-                    
-                    interaction_edges = node.get('interactions', {}).get('edges', [])
-                    
-                    genes = []
-                    for int_edge in interaction_edges:
-                        int_node = int_edge.get('node', {})
-                        gene = int_node.get('gene', {}).get('name')
-                        if gene:
-                            genes.append(gene)
-                    
-                    print(f"\n🔬 {drug_name}")
-                    print(f"   Concept ID: {concept_id}")
-                    print(f"   Approved: {approved}")
-                    print(f"   Targets: {len(genes)} genes")
-                    print(f"   Sample targets: {genes[:10]}")
-                
-                print("\n" + "=" * 80)
-                print("✅ DGIdb API IS WORKING WITH CORRECT FORMAT!")
-                print("=" * 80)
-                
-                return data
-        
-        except Exception as e:
-            print(f"❌ Request failed: {e}")
-            import traceback
-            traceback.print_exc()
+                json=body,
+                headers={"Content-Type": "application/json"},
+            ) as r:
+                return r.status, await r.json()
+
+        # ── 1. What fields does DrugConnection have? ─────────────────────────
+        print("\n─── DrugConnection fields ───")
+        _, d = await gql('{ __type(name:"DrugConnection"){ fields{ name } } }')
+        dc_fields = [f["name"] for f in (d.get("data",{}).get("__type",{}) or {}).get("fields",[])]
+        print("  ", dc_fields)
+
+        # ── 2. What fields does DrugEdge have? ───────────────────────────────
+        print("─── DrugEdge fields ───")
+        _, d = await gql('{ __type(name:"DrugEdge"){ fields{ name } } }')
+        de_fields = [f["name"] for f in (d.get("data",{}).get("__type",{}) or {}).get("fields",[])]
+        print("  ", de_fields)
+
+        # ── 3. Try every plausible pattern ───────────────────────────────────
+        names = ["NILOTINIB", "IMATINIB"]
+        patterns = {
+            "nodes":              "{ drugs(names:$n){ nodes{ name interactions{ gene{ name } } } } }",
+            "edges.node":         "{ drugs(names:$n){ edges{ node{ name interactions{ gene{ name } } } } } }",
+            "direct (no wrap)":   "{ drugs(names:$n){ name interactions{ gene{ name } } } }",
+        }
+
+        # Also probe the return type of drugs() to confirm
+        print("─── drugs() return type ───")
+        _, d = await gql('{ __schema{ queryType{ fields{ name type{ name kind ofType{ name kind } } } } } }')
+        qtfields = d.get("data",{}).get("__schema",{}).get("queryType",{}).get("fields",[]) or []
+        dfield = next((f for f in qtfields if f["name"]=="drugs"), None)
+        if dfield:
+            t = dfield["type"]
+            print(f"  drugs() returns: kind={t['kind']} name={t['name']} ofType={t.get('ofType')}")
+
+        print("\n─── Trying access patterns ───")
+        for label, q in patterns.items():
+            full_q = "query Q($n:[String!]!) " + q
+            status, data = await gql(full_q, {"n": names})
+            if "errors" in data:
+                msgs = [e["message"] for e in data["errors"]]
+                print(f"  ✗ {label}: {msgs[0]}")
+            else:
+                print(f"  ✓ {label}: SUCCESS")
+                # Show a sample
+                raw = data.get("data",{}).get("drugs",{})
+                print(f"    raw keys: {list(raw.keys()) if isinstance(raw, dict) else type(raw)}")
+                break
+
+        print("\nDone. Use the ✓ pattern above in data_fetcher.py\n")
 
 
-if __name__ == "__main__":
-    asyncio.run(test_correct_format())
+asyncio.run(main())
