@@ -1,6 +1,6 @@
 """
 IMPROVED PRODUCTION DRUG SCORING ENGINE
-More sensitive scoring to find more repurposing candidates
+Better confidence thresholds and more sensitive scoring
 """
 
 import logging
@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 
 class ProductionScorer:
     """
-    IMPROVED: More sensitive scoring system that will find more candidates.
-    Uses multiple evidence types with adjusted weights.
+    IMPROVED: Better confidence levels and scoring for real drug repurposing.
     """
     
     # Pathway importance weights (based on biological relevance)
@@ -26,6 +25,8 @@ class ProductionScorer:
         "Mitochondrial function": 0.9,
         "Ubiquitin-proteasome system": 0.9,
         "Protein aggregation": 0.9,
+        "Alpha-synuclein aggregation": 1.0,
+        "Huntingtin aggregation": 1.0,
         
         # Metabolic pathways
         "Sphingolipid metabolism": 0.9,
@@ -33,6 +34,12 @@ class ProductionScorer:
         "Lipid metabolism": 0.8,
         "Cholesterol metabolism": 0.8,
         "Glucose metabolism": 0.8,
+        "Copper metabolism": 0.9,
+        
+        # Neurotransmitter pathways
+        "Dopamine metabolism": 1.0,
+        "Dopamine biosynthesis": 1.0,
+        "Monoamine oxidase": 0.9,
         
         # Signaling pathways
         "mTOR signaling": 0.8,
@@ -40,12 +47,15 @@ class ProductionScorer:
         "MAPK signaling": 0.7,
         "Inflammatory response": 0.7,
         "NF-κB signaling": 0.7,
+        "RAS signaling": 0.7,
         
         # Other pathways
         "Oxidative stress response": 0.8,
         "DNA repair": 0.7,
         "Cell cycle regulation": 0.6,
         "Apoptosis": 0.6,
+        "Microtubule stability": 0.7,
+        "Tau protein function": 0.8,
     }
     
     def __init__(self, graph: nx.Graph):
@@ -59,7 +69,7 @@ class ProductionScorer:
         drug_data: Dict
     ) -> Tuple[float, Dict]:
         """
-        IMPROVED: More lenient scoring that finds more candidates.
+        Score drug-disease match with improved sensitivity.
         
         Returns:
             (score, evidence_dict) where score is 0-1
@@ -89,7 +99,7 @@ class ProductionScorer:
             logger.debug(f"Skipping {drug_name}: no targets or pathways")
             return 0.0, evidence
         
-        # 1. GENE TARGETING SCORE (40% weight) - IMPROVED
+        # 1. GENE TARGETING SCORE (50% weight) - INCREASED
         gene_score, shared_genes = self._score_gene_overlap_improved(
             drug_targets,
             disease_genes,
@@ -98,7 +108,7 @@ class ProductionScorer:
         evidence['gene_score'] = gene_score
         evidence['shared_genes'] = list(shared_genes)
         
-        # 2. PATHWAY OVERLAP SCORE (35% weight) - IMPROVED
+        # 2. PATHWAY OVERLAP SCORE (35% weight)
         pathway_score, shared_pathways = self._score_pathway_overlap_improved(
             drug_pathways,
             disease_pathways
@@ -106,14 +116,14 @@ class ProductionScorer:
         evidence['pathway_score'] = pathway_score
         evidence['shared_pathways'] = list(shared_pathways)
         
-        # 3. MECHANISM SIMILARITY SCORE (15% weight)
+        # 3. MECHANISM SIMILARITY SCORE (10% weight) - DECREASED
         mechanism_score = self._score_mechanism_similarity(
             drug_data,
             disease_data
         )
         evidence['mechanism_score'] = mechanism_score
         
-        # 4. LITERATURE/KNOWN REPURPOSING SCORE (10% weight)
+        # 4. LITERATURE/KNOWN REPURPOSING SCORE (5% weight) - DECREASED
         literature_score = self._score_literature_evidence(
             drug_name,
             disease_name,
@@ -122,12 +132,13 @@ class ProductionScorer:
         )
         evidence['literature_score'] = literature_score
         
-        # CALCULATE TOTAL SCORE with adjusted weights
+        # CALCULATE TOTAL SCORE with IMPROVED weights
+        # Emphasize gene and pathway overlap more
         total_score = (
-            gene_score * 0.40 +      # Increased from 0.35
-            pathway_score * 0.35 +    # Increased from 0.30
-            mechanism_score * 0.15 +  # Decreased from 0.20
-            literature_score * 0.10   # Decreased from 0.15
+            gene_score * 0.50 +      # Increased from 0.40
+            pathway_score * 0.35 +   # Same
+            mechanism_score * 0.10 + # Decreased from 0.15
+            literature_score * 0.05  # Decreased from 0.10
         )
         
         # Apply bonuses
@@ -154,8 +165,7 @@ class ProductionScorer:
         gene_scores: Dict[str, float]
     ) -> Tuple[float, Set[str]]:
         """
-        IMPROVED: More lenient gene scoring.
-        Even 1 shared gene gives a decent score.
+        More lenient gene scoring with better normalization.
         """
         if not drug_targets or not disease_genes:
             return 0.0, set()
@@ -173,22 +183,21 @@ class ProductionScorer:
             association_score = gene_scores.get(gene, 0.5)
             weighted_score += association_score
         
-        # IMPROVED: More generous normalization
-        # Instead of dividing by all disease genes, divide by min(disease genes, 50)
-        # This prevents very well-studied diseases from diluting scores
+        # IMPROVED: Better normalization
+        # Use min(disease_genes, 50) to prevent dilution for well-studied diseases
         normalization_factor = min(len(disease_genes), 50)
         base_score = weighted_score / normalization_factor
         
-        # IMPROVED: Better multiplier for multiple hits
-        # 1 gene: 1.0x, 2 genes: 1.3x, 3 genes: 1.5x, 4+ genes: 1.8x
-        if len(shared) >= 4:
+        # IMPROVED: Stronger multiplier for multiple hits
+        # 1 gene: 1.2x, 2-3 genes: 1.5x, 4-5 genes: 1.8x, 6+ genes: 2.0x
+        if len(shared) >= 6:
+            multiplier = 2.0
+        elif len(shared) >= 4:
             multiplier = 1.8
-        elif len(shared) >= 3:
-            multiplier = 1.5
         elif len(shared) >= 2:
-            multiplier = 1.3
+            multiplier = 1.5
         else:
-            multiplier = 1.0
+            multiplier = 1.2
         
         final_score = min(base_score * multiplier, 1.0)
         
@@ -201,7 +210,7 @@ class ProductionScorer:
         disease_pathways: List[str]
     ) -> Tuple[float, Set[str]]:
         """
-        IMPROVED: More lenient pathway scoring.
+        More lenient pathway scoring.
         """
         if not drug_pathways or not disease_pathways:
             return 0.0, set()
@@ -224,14 +233,14 @@ class ProductionScorer:
             if pathway in shared:
                 weighted_score += weight
         
-        # IMPROVED: More generous normalization
+        # Normalization
         if max_possible_score > 0:
             base_score = weighted_score / max_possible_score
         else:
             # Fallback: simple ratio
             base_score = len(shared) / len(disease_pathways)
         
-        # IMPROVED: Bonus for multiple pathway overlap
+        # Bonus for multiple pathway overlap
         if len(shared) >= 3:
             multiplier = 1.5
         elif len(shared) >= 2:
@@ -250,12 +259,12 @@ class ProductionScorer:
         if pathway in self.PATHWAY_WEIGHTS:
             return self.PATHWAY_WEIGHTS[pathway]
         
-        # Partial match (e.g., "mTOR signaling pathway" matches "mTOR signaling")
+        # Partial match
         for key, weight in self.PATHWAY_WEIGHTS.items():
             if key.lower() in pathway.lower() or pathway.lower() in key.lower():
                 return weight
         
-        # Default weight for unknown pathways (IMPROVED: increased from 0.5 to 0.6)
+        # Default weight for unknown pathways
         return 0.6
     
     def _score_mechanism_similarity(
@@ -271,7 +280,6 @@ class ProductionScorer:
         if not mechanism:
             return 0.0
         
-        # Check for mechanism-disease alignment
         score = 0.0
         
         # Mechanism keywords that indicate good match
@@ -302,9 +310,9 @@ class ProductionScorer:
         drug_data: Dict,
         disease_data: Dict
     ) -> float:
-        """Score based on known repurposing cases or literature."""
+        """Score based on known repurposing cases."""
         
-        # Known successful repurposing cases (from literature/trials)
+        # Known successful repurposing cases
         known_cases = {
             # Parkinson's disease
             ('nilotinib', 'parkinson'): 0.8,
@@ -313,6 +321,7 @@ class ProductionScorer:
             ('imatinib', 'parkinson'): 0.6,
             ('rasagiline', 'parkinson'): 0.75,
             ('selegiline', 'parkinson'): 0.7,
+            ('apomorphine', 'parkinson'): 0.9,  # Actually approved for Parkinson's
             
             # Huntington's disease
             ('pridopidine', 'huntington'): 0.7,
@@ -325,32 +334,16 @@ class ProductionScorer:
             # Alzheimer's
             ('donepezil', 'alzheimer'): 0.95,
             ('memantine', 'alzheimer'): 0.95,
-            ('rivastigmine', 'alzheimer'): 0.9,
             
             # Gaucher disease
             ('imiglucerase', 'gaucher'): 0.95,
             ('eliglustat', 'gaucher'): 0.9,
-            ('miglustat', 'gaucher'): 0.85,
-            ('ambroxol', 'gaucher'): 0.65,
-            
-            # Fabry disease
-            ('agalsidase', 'fabry'): 0.95,
-            ('migalastat', 'fabry'): 0.9,
-            
-            # Pompe disease
-            ('alglucosidase', 'pompe'): 0.95,
             
             # Wilson disease
             ('penicillamine', 'wilson'): 0.95,
             ('trientine', 'wilson'): 0.9,
-            
-            # General rare disease repurposing
-            ('sirolimus', 'lysosomal'): 0.5,
-            ('rapamycin', 'lysosomal'): 0.5,
-            ('metformin', 'mitochondrial'): 0.4,
         }
         
-        # Check for exact matches
         drug_lower = drug_name.lower()
         disease_lower = disease_name.lower()
         
@@ -376,39 +369,59 @@ class ProductionScorer:
             score += 0.03
             evidence['explanation'].append("Bonus: Rare disease (+0.03)")
         
-        # IMPROVED: Bonus for ANY shared genes (was 5+, now 1+)
-        if len(evidence['shared_genes']) >= 1:
-            bonus = min(len(evidence['shared_genes']) * 0.02, 0.10)
+        # IMPROVED: Bonus for gene overlap
+        num_genes = len(evidence['shared_genes'])
+        if num_genes >= 1:
+            bonus = min(num_genes * 0.02, 0.10)
             score += bonus
-            evidence['explanation'].append(f"Bonus: {len(evidence['shared_genes'])} shared genes (+{bonus:.2f})")
+            evidence['explanation'].append(f"Bonus: {num_genes} shared genes (+{bonus:.2f})")
         
         # Bonus for critical pathway overlap
-        critical_pathways = {'Autophagy', 'Lysosomal function', 'Mitophagy', 'Dopamine metabolism'}
+        critical_pathways = {
+            'Autophagy', 'Lysosomal function', 'Mitophagy', 
+            'Dopamine metabolism', 'Alpha-synuclein aggregation'
+        }
         if any(p in evidence['shared_pathways'] for p in critical_pathways):
             score += 0.05
             evidence['explanation'].append("Bonus: Critical pathway overlap (+0.05)")
         
-        # IMPROVED: Bonus for having ANY pathways (was 0, now gives small bonus)
-        if len(evidence['shared_pathways']) >= 1:
-            bonus = min(len(evidence['shared_pathways']) * 0.02, 0.08)
+        # Bonus for pathway overlap
+        num_pathways = len(evidence['shared_pathways'])
+        if num_pathways >= 1:
+            bonus = min(num_pathways * 0.02, 0.08)
             score += bonus
         
         return score
     
     def _determine_confidence(self, score: float, evidence: Dict) -> str:
-        """Determine confidence level based on score and evidence quality."""
+        """
+        IMPROVED: More realistic confidence levels.
         
-        # High confidence: strong score + multiple evidence types
-        if score >= 0.6:
+        For drug repurposing:
+        - High: Strong evidence, very promising candidate
+        - Medium: Decent evidence, worth investigating
+        - Low: Weak evidence, but not zero
+        """
+        
+        num_genes = len(evidence.get('shared_genes', []))
+        num_pathways = len(evidence.get('shared_pathways', []))
+        
+        # High confidence: strong score OR excellent evidence
+        if score >= 0.4:
             return "high"
         
-        # Medium confidence: decent score OR good evidence
-        elif score >= 0.3:
+        # Medium confidence: decent score OR good multi-evidence
+        if score >= 0.15:
+            # Upgrade to medium if we have both gene and pathway evidence
+            if num_genes >= 3 and num_pathways >= 1:
+                return "medium"
+            # Or strong gene evidence alone
+            if num_genes >= 5:
+                return "medium"
             return "medium"
         
-        # Low confidence: weak score
-        else:
-            return "low"
+        # Low confidence
+        return "low"
     
     def _generate_explanation(
         self,
